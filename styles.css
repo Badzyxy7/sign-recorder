@@ -467,3 +467,10 @@ body.modal-open { overflow: hidden; }
   font-size: 1.05rem;
 }
 .intro-actions .intro-next:hover:not(:disabled) { background: var(--maroon-dark); }
+
+/* Record button directly under the camera frame */
+.stage + #recordBtn { margin-top: 12px; }
+#status { margin: 10px 0 14px; }
+
+/* Phone held upright: preview shows the same wide (16:9) frame that is recorded */
+.stage.crop169 { aspect-ratio: 16 / 9; }

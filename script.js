@@ -1,5 +1,5 @@
 /* ============================================================
-   Sign Clip Recorder - script.js
+   Sign Clip Recorder - script.js  (PC + mobile, always landscape)
    ============================================================ */
 
 /* ============================ SETTINGS (edit me) ============================ */
@@ -19,8 +19,11 @@ const COUNTDOWN_S    = 3;       // countdown seconds before recording
 const MAX_RECORD_MS  = 10000;   // hard limit on clip length
 const NO_HANDS_MS    = 5000;    // cancel if no hands appear within this time of recording start
 const MAX_HANDS      = 2;
+const REC_W = 1280, REC_H = 720; // every recorded clip is this landscape size (16:9)
+const VIDEO_BITRATE  = 4000000; // recording quality (bits per second)
 const MP_VERSION     = "0.10.14"; // pinned @mediapipe/tasks-vision version
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const MOBILE_ROOT_FOLDER = "clips"; // folder created inside the phone browser's storage
 
 // Preferred recording formats, tried in order. Falls back to WebM if MP4 isn't supported.
 const FORMATS = [
@@ -35,10 +38,26 @@ const FORMATS = [
 const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
 const recordBtn = $("recordBtn"), folderBtn = $("folderBtn"), labelSelect = $("label");
-const hasFSA = "showDirectoryPicker" in window;
+const exportBtn = $("exportBtn"), clearBtn = $("clearBtn"), cancelBtn = $("cancelBtn");
+
+// Hidden landscape canvas: the camera image is cropped to 16:9 and drawn here every frame.
+// Hand detection and the recording both use THIS canvas, so clips are always landscape.
+const recCanvas = document.createElement("canvas");
+recCanvas.width = REC_W; recCanvas.height = REC_H;
+const recCtx = recCanvas.getContext("2d");
+canvas.width = REC_W; canvas.height = REC_H;   // landmark overlay has the same size
+
+// Folder modes:
+//  - PC Chrome/Edge:  real folder picker (showDirectoryPicker)
+//  - Phones/others:   a "clips" folder created inside the browser storage (OPFS), exported as a ZIP
+const hasFSA  = "showDirectoryPicker" in window;
+const hasOPFS = !!(navigator.storage && navigator.storage.getDirectory);
+const useOPFS = !hasFSA && hasOPFS;
+const folderMode = hasFSA || hasOPFS;          // a folder must be created/chosen before recording
+const isTouch = window.matchMedia && matchMedia("(pointer: coarse)").matches;
 
 let state = "loading";           // loading | idle | countdown | recording | saving
-let stream = null, landmarker = null, dirHandle = null;
+let stream = null, recStream = null, landmarker = null, dirHandle = null;
 let recorder = null, chunks = [], discard = false;
 let countdownTimer = null, maxTimer = null, noHandsTimer = null;
 let recStart = 0, lastMove = 0, hasMoved = false, handsSeen = false;
@@ -47,8 +66,6 @@ let landmarkFrames = [];         // one Float32Array(126) per processed frame wh
 const sessionCounts = {};        // fallback numbering when no folder is used
 
 // Build the grouped dropdown: category header (disabled) > word (optgroup) > "<WORD> — LEFT HAND" / "<WORD> — RIGHT HAND"
-// Each entry: { word: "BATHROOM", side: "LEFT", prefix: "BATHROOM_LEFT" }
-// The word is repeated in each option so the closed dropdown still shows the full choice.
 const ENTRIES = [];
 CATEGORIES.forEach(cat => {
   const head = new Option(`── ${cat.name} ──`, "");
@@ -71,34 +88,80 @@ const currentEntry = () => ENTRIES.find(e => e.prefix === labelSelect.value);
 /* ============================ UI HELPERS ==================================== */
 const setStatus = t => { $("status").textContent = t; };
 function showError(msg) { const e = $("error"); e.textContent = msg; e.hidden = !msg; }
+
 function canRecord() {
-  return state === "idle" && stream && landmarker && (dirHandle || !hasFSA);
+  return state === "idle" && stream && landmarker && (dirHandle || !folderMode);
 }
 function setState(s, msg) {
   state = s;
   if (msg) setStatus(msg);
   recordBtn.disabled = !canRecord();
-  folderBtn.disabled = !hasFSA || s !== "idle";
+  folderBtn.disabled = !folderMode || s !== "idle";
   labelSelect.disabled = s !== "idle";
+  exportBtn.disabled = !dirHandle || s !== "idle";
+  clearBtn.disabled = !dirHandle || s !== "idle";
+  cancelBtn.hidden = !(useOPFS && (s === "countdown" || s === "recording"));
 }
+
+// Phone held upright: show the preview as a wide 16:9 frame (same crop that gets recorded).
+// The old "rotate your phone" lock is no longer needed.
+function updateOrientation() {
+  const portrait = video.videoWidth > 0 && video.videoWidth < video.videoHeight;
+  document.querySelector(".stage").classList.toggle("crop169", portrait);
+  $("rotate").hidden = true;
+  recordBtn.disabled = !canRecord();
+}
+
+/* ============================ CAMERA ======================================== */
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: "user",
+      width:  { ideal: isTouch ? 1920 : 1280 },
+      height: { ideal: isTouch ? 1080 : 720 },
+    },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+  lastVideoTime = -1; prevHands = null;
+}
+
+// Draw the camera image into the landscape canvas (center crop to 16:9, never mirrored)
+function drawLandscapeFrame() {
+  const sw = video.videoWidth, sh = video.videoHeight;
+  if (!sw || !sh) return;
+  const target = REC_W / REC_H;
+  let cw = sw, ch = sh;
+  if (sw / sh > target) cw = sh * target;      // camera is wider than 16:9: trim the sides
+  else ch = sw / target;                        // camera is taller (phone upright): trim top and bottom
+  const sx = (sw - cw) / 2, sy = (sh - ch) / 2;
+  recCtx.drawImage(video, sx, sy, cw, ch, 0, 0, REC_W, REC_H);
+}
+
+video.addEventListener("resize", updateOrientation);
+window.addEventListener("orientationchange", () => setTimeout(updateOrientation, 300));
 
 /* ============================ STARTUP ======================================= */
 async function init() {
-  // Browser support check (Chrome / Edge needed for reliable MediaRecorder + folder access)
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-    showError("This browser is not supported. Open the page in Chrome or Edge.");
+  // Browser support check (Chrome / Edge / Safari needed for MediaRecorder)
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder || !recCanvas.captureStream) {
+    showError("This browser is not supported. Open the page in Chrome (Android / PC), Edge, or Safari (iPhone).");
     return setStatus("Unsupported browser");
   }
-  if (!hasFSA) {
+  if (useOPFS) {
+    folderBtn.textContent = "📁 Create clips folder";
+    $("folderName").textContent = "No folder created yet. Tap “Create clips folder” first.";
+    $("mobileTools").hidden = false;
+  } else if (!hasFSA) {
     showError("Folder saving is not available in this browser. Clips will download normally. Use Chrome or Edge for automatic saving.");
     folderBtn.disabled = true;
     $("folderName").textContent = "Using normal downloads.";
   }
   // Camera
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false });
-    video.srcObject = stream;
-    await video.play();
+    await startCamera();
   } catch (err) {
     showError("Camera unavailable: " + (err.name === "NotAllowedError"
       ? "access was blocked. Allow the camera in the address bar and reload."
@@ -120,17 +183,27 @@ async function init() {
     showError("Could not load hand tracking (check your internet connection): " + err.message);
     return setStatus("Hand tracking failed");
   }
-  setState("idle", dirHandle || !hasFSA ? "Ready" : "Choose a save folder to begin");
+  setState("idle", dirHandle || !folderMode ? "Ready" : (useOPFS ? "Create the clips folder to begin" : "Choose a save folder to begin"));
+  updateOrientation();
   refreshNext();
   requestAnimationFrame(loop);
 }
 
-/* ============================ FOLDER PICKER ================================= */
+/* ============================ FOLDER PICKER / CREATOR ======================= */
 folderBtn.addEventListener("click", async () => {
   try {
-    dirHandle = await showDirectoryPicker({ mode: "readwrite" });
-    $("folderName").textContent = "Saving to folder: " + dirHandle.name;
+    if (useOPFS) {
+      // Phone: create (or reopen) the "clips" folder inside the browser's private storage
+      const root = await navigator.storage.getDirectory();
+      dirHandle = await root.getDirectoryHandle(MOBILE_ROOT_FOLDER, { create: true });
+      try { await navigator.storage.persist(); } catch {}
+      $("folderName").textContent = `Folder “${MOBILE_ROOT_FOLDER}” is ready. Clips are stored inside it.`;
+    } else {
+      dirHandle = await showDirectoryPicker({ mode: "readwrite" });
+      $("folderName").textContent = "Saving to folder: " + dirHandle.name;
+    }
     setState("idle", "Ready");
+    updateOrientation();
     refreshNext();
   } catch (err) {
     if (err.name !== "AbortError") showError("Could not open folder: " + err.message);
@@ -238,11 +311,11 @@ function loop() {
   if (video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
 
-  if (canvas.width !== video.videoWidth) { canvas.width = video.videoWidth; canvas.height = video.videoHeight; }
-  const res = landmarker.detectForVideo(video, performance.now());
+  drawLandscapeFrame();                                  // landscape crop (this is what gets recorded)
+  const res = landmarker.detectForVideo(recCanvas, performance.now());
   const hands = res.landmarks || [];
 
-  // Draw landmarks on the overlay only (the recording uses the raw stream)
+  // Draw landmarks on the overlay only (the recording is the clean landscape canvas)
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const draw = new _mp.DrawingUtils(ctx);
   for (const h of hands) {
@@ -272,15 +345,18 @@ async function startRecording() {
     $("countdown").classList.add("on");
     setStatus("Countdown: " + n);
     await new Promise(r => { countdownTimer = setTimeout(r, 1000); });
-    if (state !== "countdown") return;           // cancelled with Esc
+    if (state !== "countdown") return;           // cancelled with Esc / Cancel button
   }
   $("countdown").classList.remove("on");
 
-  // Start capturing the raw camera stream (unmirrored, no overlay), MP4 if supported
+  // Record the landscape canvas (always 16:9, unmirrored, no landmarks), MP4 if supported
   chunks = []; landmarkFrames = []; discard = false; hasMoved = false; handsSeen = false; prevHands = null;
   const fmt = FORMATS.find(f => MediaRecorder.isTypeSupported(f.mime));
   fileExt = fmt ? fmt.ext : "webm";
-  recorder = new MediaRecorder(stream, fmt ? { mimeType: fmt.mime } : undefined);
+  recStream = recCanvas.captureStream(30);
+  const opts = { videoBitsPerSecond: VIDEO_BITRATE };
+  if (fmt) opts.mimeType = fmt.mime;
+  recorder = new MediaRecorder(recStream, opts);
   recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
   recorder.onstop = onRecorderStop;
   recorder.start();
@@ -319,6 +395,7 @@ async function onRecorderStop() {
   const frames = landmarkFrames;
   const entry = currentEntry();
   const wasDiscarded = discard;
+  recStream?.getTracks().forEach(t => t.stop()); recStream = null;
   recorder = null; chunks = []; landmarkFrames = []; discard = false;   // clean up recorder state
   if (wasDiscarded) { setState("idle"); refreshNext(); return; }
   try {
@@ -338,12 +415,48 @@ async function onRecorderStop() {
   refreshNext();
 }
 
+// Fallback writer for browsers (iPhone Safari) that cannot use createWritable():
+// a small background worker writes the file with a sync access handle.
+let writeWorker = null;
+function workerWrite(dir, name, blob) {
+  return new Promise(async (resolve, reject) => {
+    if (!writeWorker) {
+      const code = `
+        self.onmessage = async e => {
+          const { dir, name, buf, id } = e.data;
+          try {
+            const fh = await dir.getFileHandle(name, { create: true });
+            const h = await fh.createSyncAccessHandle();
+            h.truncate(0);
+            h.write(new Uint8Array(buf), { at: 0 });
+            h.flush(); h.close();
+            self.postMessage({ id, ok: true });
+          } catch (err) { self.postMessage({ id, ok: false, error: String(err) }); }
+        };`;
+      writeWorker = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+    }
+    const id = Math.random();
+    const buf = await blob.arrayBuffer();
+    const onMsg = e => {
+      if (e.data.id !== id) return;
+      writeWorker.removeEventListener("message", onMsg);
+      e.data.ok ? resolve() : reject(new Error(e.data.error));
+    };
+    writeWorker.addEventListener("message", onMsg);
+    writeWorker.postMessage({ dir, name, buf, id }, [buf]);
+  });
+}
+
 // Write one file into a folder handle, or download it if no folder is available
 async function writeFile(dir, name, blob) {
   if (dir) {
     const fh = await dir.getFileHandle(name, { create: true });
-    const w = await fh.createWritable();
-    await w.write(blob); await w.close();
+    if (typeof fh.createWritable === "function") {
+      const w = await fh.createWritable();
+      await w.write(blob); await w.close();
+    } else {
+      await workerWrite(dir, name, blob);
+    }
   } else {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob); a.download = name; a.click();
@@ -363,9 +476,141 @@ async function saveClip(videoBlob, dataBlob, entry) {
   return dataBlob ? `${base}.${fileExt} + ${base}.${LANDMARK_FORMAT}` : `${base}.${fileExt}`;
 }
 
+/* ============================ MOBILE: EXPORT AS ZIP ========================= */
+// Minimal ZIP writer (no compression, keeps the folder structure clips/WORD/file)
+let crcTable = null;
+function crc32(u8) {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c >>> 0;
+    }
+  }
+  let c = 0xffffffff;
+  for (let i = 0; i < u8.length; i++) c = crcTable[(c ^ u8[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function makeZip(entries) {               // entries: [{ path, data: Uint8Array }]
+  const enc = new TextEncoder();
+  const d = new Date();
+  const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  const parts = [], central = [];
+  let offset = 0;
+  for (const e of entries) {
+    const name = enc.encode(e.path);
+    const crc = crc32(e.data), size = e.data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
+    lh.setUint16(8, 0, true);  lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, size, true); lh.setUint32(22, size, true);
+    lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
+    parts.push(lh.buffer, name, e.data);
+
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
+    ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true);
+    ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true);
+    ch.setUint32(16, crc, true); ch.setUint32(20, size, true); ch.setUint32(24, size, true);
+    ch.setUint16(28, name.length, true); ch.setUint32(42, offset, true);
+    central.push(ch.buffer, name);
+    offset += 30 + name.length + size;
+  }
+  const cdSize = central.reduce((s, p) => s + (p.byteLength ?? p.length), 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, entries.length, true); end.setUint16(10, entries.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+}
+
+async function collectFiles(dir, prefix, out) {
+  for await (const [name, handle] of dir.entries()) {
+    if (handle.kind === "file") out.push({ path: prefix + name, handle });
+    else await collectFiles(handle, prefix + name + "/", out);
+  }
+}
+
+exportBtn.addEventListener("click", async () => {
+  if (!dirHandle) return;
+  try {
+    setStatus("Preparing ZIP…");
+    exportBtn.disabled = true;
+    const list = [];
+    await collectFiles(dirHandle, dirHandle.name + "/", list);
+    if (!list.length) { setStatus("No clips to save yet."); return; }
+    const entries = [];
+    for (const f of list) {
+      const file = await f.handle.getFile();
+      entries.push({ path: f.path, data: new Uint8Array(await file.arrayBuffer()) });
+    }
+    const zip = makeZip(entries);
+    const t = new Date(), p = n => String(n).padStart(2, "0");
+    const name = `clips_${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}_${p(t.getHours())}${p(t.getMinutes())}.zip`;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(zip); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    setStatus(`ZIP saved to your Downloads (${list.length} files). Upload it to Google Drive.`);
+  } catch (err) {
+    showError("Could not create the ZIP: " + err.message);
+    setStatus("ZIP failed");
+  } finally {
+    exportBtn.disabled = !dirHandle || state !== "idle";
+  }
+});
+
+clearBtn.addEventListener("click", async () => {
+  if (!dirHandle) return;
+  if (!confirm("Delete ALL clips stored in the app? Make sure you already saved the ZIP and uploaded it.")) return;
+  try {
+    const names = [];
+    for await (const [name] of dirHandle.entries()) names.push(name);
+    for (const n of names) await dirHandle.removeEntry(n, { recursive: true });
+    Object.keys(sessionCounts).forEach(k => delete sessionCounts[k]);
+    setStatus("Stored clips cleared.");
+    refreshNext();
+  } catch (err) {
+    showError("Could not clear clips: " + err.message);
+  }
+});
+
+cancelBtn.addEventListener("click", cancelAll);
+
 /* ============================ FIRST-TIME INSTRUCTIONS ======================= */
 const INTRO_KEY = "signRecorderIntroDone";
-const INTRO_STEPS = [
+const INTRO_STEPS = useOPFS ? [
+  {
+    icon: "📱",
+    title: "Hold your phone steady",
+    text: "You can hold your phone upright or sideways. Clips are always recorded in landscape (wide) format, so the preview shows the wide frame. Keep your hands inside the preview. Sideways gives the sharpest video.",
+  },
+  {
+    icon: "📁",
+    title: "Create the clips folder",
+    text: "Tap the “📁 Create clips folder” button. The Record button stays locked until the folder is created. The folder is kept inside this website's storage on your phone.",
+    tree: "clips/",
+  },
+  {
+    icon: "🔤",
+    title: "Select a word from the dropdown",
+    text: "Open the dropdown and pick a word or letter. Each option shows which hand to use, for example BATHROOM — LEFT HAND. The system automatically creates a folder with that word's name inside clips.",
+    tree: "clips/\n└─ BATHROOM/   ← created automatically",
+  },
+  {
+    icon: "🎥",
+    title: "Record your sign",
+    text: `Tap Record. After the ${COUNTDOWN_S}-second countdown, sign with the hand shown in the badge. The recording stops by itself when you hold still. Tap Cancel to discard a clip (nothing is saved). Every clip is saved automatically as 2 files with the same name:`,
+    tree: `clips/\n└─ BATHROOM/\n   ├─ BATHROOM_LEFT_001.mp4   (the video)\n   └─ BATHROOM_LEFT_001.${LANDMARK_FORMAT}   (hand landmark data)`,
+  },
+  {
+    icon: "☁️",
+    title: "Save the ZIP and upload to Google Drive",
+    text: "When you are finished, tap “📦 Save all clips (ZIP)”. The ZIP (with the clips folder inside) is saved to your phone's Downloads. Upload it to our shared Google Drive. Do not rename or edit the files inside.",
+  },
+] : [
   {
     icon: "📁",
     title: "Create a folder named “clips”",

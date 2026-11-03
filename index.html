@@ -23,7 +23,16 @@
     <canvas id="overlay"></canvas>
     <div id="countdown" class="countdown"></div>
     <div id="badge" class="badge"><i></i>Recording</div>
+    <div id="rotate" class="rotate" hidden>
+      <div class="rotate-icon" aria-hidden="true">📱↻</div>
+      <div>Rotate your phone to <b>landscape</b> to record</div>
+    </div>
   </div>
+
+  <!-- Record / Cancel buttons and status, right under the camera frame -->
+  <button id="recordBtn" type="button" disabled>● Record</button>
+  <button id="cancelBtn" type="button" class="cancel-btn" hidden>✕ Cancel clip</button>
+  <p id="status" role="status" aria-live="polite">Starting…</p>
 
   <div class="sign-card">
     <div>
@@ -43,9 +52,12 @@
   <p id="folderName" class="folder">No folder chosen.</p>
   <p id="nextFile" class="folder"></p>
 
-  <button id="recordBtn" type="button" disabled>● Record</button>
-  <p id="status" role="status" aria-live="polite">Starting…</p>
-  <p class="hint"><kbd>Space</kbd> starts a recording. <kbd>Esc</kbd> cancels the countdown or the current clip (nothing is saved).</p>
+  <p class="hint"><kbd>Space</kbd> starts a recording. <kbd>Esc</kbd> cancels the countdown or the current clip (nothing is saved). On a phone, tap Record and tap Cancel to stop a clip.</p>
+
+  <div id="mobileTools" class="controls mobile-tools" hidden>
+    <button id="exportBtn" type="button">📦 Save all clips (ZIP)</button>
+    <button id="clearBtn" type="button">🗑 Clear stored clips</button>
+  </div>
 
   <h2>Saved this session: <span id="count">0</span></h2>
   <ul id="clips"><li class="empty">No clips yet.</li></ul>
