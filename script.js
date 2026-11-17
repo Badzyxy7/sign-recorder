@@ -1,5 +1,5 @@
 /* ============================================================
-   Sign Clip Recorder - script.js  (PC + mobile, always landscape)
+   Sign Clip Recorder - script.js  (PC + mobile, optimized)
    ============================================================ */
 
 /* ============================ SETTINGS (edit me) ============================ */
@@ -14,17 +14,27 @@ const SIDES  = ["LEFT", "RIGHT"];
 const USE_SUBFOLDERS = true;    // true: save into <chosen folder>/<WORD>/<WORD>_<SIDE>_001.mp4 (creates the subfolder if missing)
                                 // false: save everything directly in the chosen folder
 const LANDMARK_FORMAT = "npy";  // second file saved next to each video: "npy" (NumPy), "json", or "none"
-const MOVE_THRESHOLD = 0.008;   // avg landmark shift per frame (0-1 image units); below this = "still"
-const STILL_MS       = 1000;    // stillness duration (after movement) that ends the clip
+
+// When does a clip end by itself?
+const STOP_MODE      = "hands-out"; // "hands-out": when your hands leave the frame
+                                    // "still": when your hands hold still after moving
+const HANDS_OUT_MS   = 1000;    // hands-out mode: how long the hands must be out of frame
+const MOVE_THRESHOLD = 0.008;   // still mode: avg landmark shift per frame (0-1); below this = "still"
+const STILL_MS       = 1000;    // still mode: stillness duration (after movement) that ends the clip
+
 const COUNTDOWN_S    = 3;       // countdown seconds before recording
 const MAX_RECORD_MS  = 10000;   // hard limit on clip length
 const NO_HANDS_MS    = 5000;    // cancel if no hands appear within this time of recording start
 const MAX_HANDS      = 2;
-const REC_W = 1280, REC_H = 720; // every recorded clip is this landscape size (16:9)
-const VIDEO_BITRATE  = 4000000; // recording quality (bits per second)
-const MP_VERSION     = "0.10.14"; // pinned @mediapipe/tasks-vision version
+
+const REC_W = 1280, REC_H = 720;      // every recorded clip is this landscape size (16:9)
+const DETECT_W = 640, DETECT_H = 360; // hand detection runs on this smaller image (much faster)
+const REC_FPS  = 30;                  // recording frame rate
+const VIDEO_BITRATE  = 4000000;       // recording quality (bits per second)
+
+const MP_VERSION     = "0.10.14";     // pinned @mediapipe/tasks-vision version
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
-const MOBILE_ROOT_FOLDER = "clips"; // folder created inside the phone browser's storage
+const MOBILE_ROOT_FOLDER = "clips";   // folder created inside the phone browser's storage
 
 // Preferred recording formats, tried in order. Falls back to WebM if MP4 isn't supported.
 const FORMATS = [
@@ -40,13 +50,21 @@ const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
 const recordBtn = $("recordBtn"), folderBtn = $("folderBtn"), labelSelect = $("label");
 const exportBtn = $("exportBtn"), clearBtn = $("clearBtn"), cancelBtn = $("cancelBtn");
+const countdownEl = $("countdown"), badgeEl = $("badge"), stageEl = document.querySelector(".stage");
 
-// Hidden landscape canvas: the camera image is cropped to 16:9 and drawn here every frame.
-// Hand detection and the recording both use THIS canvas, so clips are always landscape.
+canvas.width = DETECT_W; canvas.height = DETECT_H;   // landmark overlay (small = fast to draw)
+
+// Small canvas used only for hand detection (always a 16:9 crop of the camera)
+const detCanvas = document.createElement("canvas");
+detCanvas.width = DETECT_W; detCanvas.height = DETECT_H;
+const detCtx = detCanvas.getContext("2d");
+
+// Big canvas used for recording ONLY when the camera is not 16:9 (upright phone, 4:3 webcam).
+// A normal 16:9 camera is recorded directly from the camera stream, which is the smoothest option.
 const recCanvas = document.createElement("canvas");
 recCanvas.width = REC_W; recCanvas.height = REC_H;
 const recCtx = recCanvas.getContext("2d");
-canvas.width = REC_W; canvas.height = REC_H;   // landmark overlay has the same size
+let recordFromCanvas = false;
 
 // Folder modes:
 //  - PC Chrome/Edge:  real folder picker (showDirectoryPicker)
@@ -55,15 +73,15 @@ const hasFSA  = "showDirectoryPicker" in window;
 const hasOPFS = !!(navigator.storage && navigator.storage.getDirectory);
 const useOPFS = !hasFSA && hasOPFS;
 const folderMode = hasFSA || hasOPFS;          // a folder must be created/chosen before recording
-const isTouch = window.matchMedia && matchMedia("(pointer: coarse)").matches;
 
 let state = "loading";           // loading | idle | countdown | recording | saving
 let stream = null, recStream = null, landmarker = null, dirHandle = null;
 let recorder = null, chunks = [], discard = false;
 let countdownTimer = null, maxTimer = null, noHandsTimer = null;
-let recStart = 0, lastMove = 0, hasMoved = false, handsSeen = false;
+let lastMove = 0, hasMoved = false, handsSeen = false, lastHandSeen = 0;
 let prevHands = null, lastVideoTime = -1, savedCount = 0, fileExt = "mp4";
 let landmarkFrames = [];         // one Float32Array(126) per processed frame while recording
+let drawer = null;               // MediaPipe drawing helper, created once
 const sessionCounts = {};        // fallback numbering when no folder is used
 
 // Build the grouped dropdown: category header (disabled) > word (optgroup) > "<WORD> — LEFT HAND" / "<WORD> — RIGHT HAND"
@@ -105,10 +123,9 @@ function setState(s, msg) {
 }
 
 // Phone held upright: show the preview as a wide 16:9 frame (same crop that gets recorded).
-// The old "rotate your phone" lock is no longer needed.
 function updateOrientation() {
   const portrait = video.videoWidth > 0 && video.videoWidth < video.videoHeight;
-  document.querySelector(".stage").classList.toggle("crop169", portrait);
+  stageEl.classList.toggle("crop169", portrait);
   $("rotate").hidden = true;
   recordBtn.disabled = !canRecord();
 }
@@ -119,8 +136,9 @@ async function startCamera() {
   stream = await navigator.mediaDevices.getUserMedia({
     video: {
       facingMode: "user",
-      width:  { ideal: isTouch ? 1920 : 1280 },
-      height: { ideal: isTouch ? 1080 : 720 },
+      width:  { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: REC_FPS, max: REC_FPS },
     },
     audio: false,
   });
@@ -129,7 +147,8 @@ async function startCamera() {
   lastVideoTime = -1; prevHands = null;
 }
 
-// Draw the camera image into the landscape canvas (center crop to 16:9, never mirrored)
+// Center-crop the camera image to 16:9 (never mirrored).
+// Small copy -> hand detection. Big copy -> recording, only if the camera is not already 16:9.
 function drawLandscapeFrame() {
   const sw = video.videoWidth, sh = video.videoHeight;
   if (!sw || !sh) return;
@@ -138,7 +157,10 @@ function drawLandscapeFrame() {
   if (sw / sh > target) cw = sh * target;      // camera is wider than 16:9: trim the sides
   else ch = sw / target;                        // camera is taller (phone upright): trim top and bottom
   const sx = (sw - cw) / 2, sy = (sh - ch) / 2;
-  recCtx.drawImage(video, sx, sy, cw, ch, 0, 0, REC_W, REC_H);
+
+  detCtx.drawImage(video, sx, sy, cw, ch, 0, 0, DETECT_W, DETECT_H);
+  recordFromCanvas = Math.abs(sw / sh - target) > 0.02;
+  if (recordFromCanvas) recCtx.drawImage(video, sx, sy, cw, ch, 0, 0, REC_W, REC_H);
 }
 
 video.addEventListener("resize", updateOrientation);
@@ -169,16 +191,18 @@ async function init() {
       : err.message));
     return setStatus("No camera");
   }
-  // Hand landmarker (MediaPipe, loaded from jsDelivr)
+  // Hand landmarker (MediaPipe, loaded from jsDelivr). GPU first, CPU as a fallback.
   try {
     setStatus("Loading hand tracking…");
     const base = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
     const mp = await import(`${base}/vision_bundle.mjs`);
     const fileset = await mp.FilesetResolver.forVisionTasks(`${base}/wasm`);
-    landmarker = await mp.HandLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: MODEL_URL },
+    const makeLandmarker = delegate => mp.HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL_URL, delegate },
       runningMode: "VIDEO", numHands: MAX_HANDS,
     });
+    try { landmarker = await makeLandmarker("GPU"); }
+    catch { landmarker = await makeLandmarker("CPU"); }
     window._mp = mp;
   } catch (err) {
     showError("Could not load hand tracking (check your internet connection): " + err.message);
@@ -187,7 +211,7 @@ async function init() {
   setState("idle", dirHandle || !folderMode ? "Ready" : (useOPFS ? "Create the clips folder to begin" : "Choose a save folder to begin"));
   updateOrientation();
   refreshNext();
-  requestAnimationFrame(loop);
+  scheduleNext();
 }
 
 /* ============================ FOLDER PICKER / CREATOR ======================= */
@@ -291,7 +315,7 @@ function makeJson(frames) {
 }
 
 /* ============================ DETECTION LOOP ================================ */
-// Average normalized distance moved by all landmarks since the previous frame.
+// Average normalized distance moved by all landmarks since the previous frame (still mode only).
 function measureMovement(hands) {
   let m = 0;
   if (prevHands && prevHands.length === hands.length && hands.length) {
@@ -307,33 +331,44 @@ function measureMovement(hands) {
   return m;
 }
 
+// Run once per camera frame (requestVideoFrameCallback), falls back to requestAnimationFrame
+function scheduleNext() {
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(loop);
+  else requestAnimationFrame(loop);
+}
+
 function loop() {
-  requestAnimationFrame(loop);
+  scheduleNext();
   if (video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
 
-  drawLandscapeFrame();                                  // landscape crop (this is what gets recorded)
-  const res = landmarker.detectForVideo(recCanvas, performance.now());
+  drawLandscapeFrame();
+  const res = landmarker.detectForVideo(detCanvas, performance.now());   // detect on the small image
   const hands = res.landmarks || [];
 
-  // Draw landmarks on the overlay only (the recording is the clean landscape canvas)
+  // Draw landmarks on the overlay only (the recording never contains them)
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const draw = new _mp.DrawingUtils(ctx);
+  drawer ||= new _mp.DrawingUtils(ctx);
   for (const h of hands) {
-    draw.drawConnectors(h, _mp.HandLandmarker.HAND_CONNECTIONS, { color: "#ffffff", lineWidth: 3 });
-    draw.drawLandmarks(h, { color: "#ffffff", fillColor: "#b3122b", lineWidth: 1, radius: 4 });
+    drawer.drawConnectors(h, _mp.HandLandmarker.HAND_CONNECTIONS, { color: "#ffffff", lineWidth: 2 });
+    drawer.drawLandmarks(h, { color: "#ffffff", fillColor: "#b3122b", lineWidth: 1, radius: 3 });
   }
 
-  const move = measureMovement(hands);
   if (state !== "recording") return;
 
   landmarkFrames.push(frameVector(res));     // store this frame's landmarks for the data file
 
   // Auto-stop logic while recording
   const now = performance.now();
-  if (hands.length) { handsSeen = true; clearTimeout(noHandsTimer); }
-  if (move > MOVE_THRESHOLD) { hasMoved = true; lastMove = now; }
-  else if (hasMoved && now - lastMove >= STILL_MS) stopRecording();
+  if (hands.length) { handsSeen = true; lastHandSeen = now; clearTimeout(noHandsTimer); }
+
+  if (STOP_MODE === "hands-out") {
+    // End the clip once hands were seen and then have been out of the frame for HANDS_OUT_MS
+    if (handsSeen && !hands.length && now - lastHandSeen >= HANDS_OUT_MS) stopRecording();
+  } else {
+    if (measureMovement(hands) > MOVE_THRESHOLD) { hasMoved = true; lastMove = now; }
+    else if (hasMoved && now - lastMove >= STILL_MS) stopRecording();
+  }
 }
 
 /* ============================ RECORD FLOW =================================== */
@@ -342,28 +377,30 @@ async function startRecording() {
   showError("");
   setState("countdown");
   for (let n = COUNTDOWN_S; n > 0; n--) {
-    $("countdown").textContent = n;
-    $("countdown").classList.add("on");
+    countdownEl.textContent = n;
+    countdownEl.classList.add("on");
     setStatus("Countdown: " + n);
     await new Promise(r => { countdownTimer = setTimeout(r, 1000); });
     if (state !== "countdown") return;           // cancelled with Esc / Cancel button
   }
-  $("countdown").classList.remove("on");
+  countdownEl.classList.remove("on");
 
-  // Record the landscape canvas (always 16:9, unmirrored, no landmarks), MP4 if supported
   chunks = []; landmarkFrames = []; discard = false; hasMoved = false; handsSeen = false; prevHands = null;
   const fmt = FORMATS.find(f => MediaRecorder.isTypeSupported(f.mime));
   fileExt = fmt ? fmt.ext : "webm";
-  recStream = recCanvas.captureStream(30);
+
+  // Smooth path: record the camera stream itself when it is already 16:9 (independent of detection speed).
+  // Only upright phones / 4:3 webcams go through the cropping canvas.
+  recStream = recordFromCanvas ? recCanvas.captureStream(REC_FPS) : stream.clone();
   const opts = { videoBitsPerSecond: VIDEO_BITRATE };
   if (fmt) opts.mimeType = fmt.mime;
   recorder = new MediaRecorder(recStream, opts);
   recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
   recorder.onstop = onRecorderStop;
   recorder.start();
-  recStart = lastMove = performance.now();
+  lastMove = lastHandSeen = performance.now();
   setState("recording", "Recording");
-  $("badge").classList.add("on");
+  badgeEl.classList.add("on");
 
   maxTimer = setTimeout(stopRecording, MAX_RECORD_MS);
   noHandsTimer = setTimeout(() => {
@@ -374,14 +411,14 @@ async function startRecording() {
 function stopRecording() {
   if (state !== "recording" || !recorder || recorder.state === "inactive") return;
   clearTimers();
-  $("badge").classList.remove("on");
+  badgeEl.classList.remove("on");
   setState("saving", discard ? undefined : "Saving…");
   recorder.stop();
 }
 
 function cancelAll() {
   if (state === "countdown") {
-    clearTimers(); $("countdown").classList.remove("on");
+    clearTimers(); countdownEl.classList.remove("on");
     setState("idle", "Cancelled");
   } else if (state === "recording") {
     discard = true; setStatus("Cancelled"); stopRecording();
@@ -396,7 +433,7 @@ async function onRecorderStop() {
   const frames = landmarkFrames;
   const entry = currentEntry();
   const wasDiscarded = discard;
-  recStream?.getTracks().forEach(t => t.stop()); recStream = null;
+  recStream?.getTracks().forEach(t => t.stop()); recStream = null;   // stops only the clone, not the live camera
   recorder = null; chunks = []; landmarkFrames = []; discard = false;   // clean up recorder state
   if (wasDiscarded) { setState("idle"); refreshNext(); return; }
   try {
@@ -582,6 +619,25 @@ cancelBtn.addEventListener("click", cancelAll);
 
 /* ============================ FIRST-TIME INSTRUCTIONS ======================= */
 const INTRO_KEY = "signRecorderIntroDone";
+
+// Steps shared by the PC and phone versions
+const STEP_WORD = {
+  icon: "🔤",
+  title: "Select a word from the dropdown",
+  text: "Open the dropdown and pick a word or letter. Each option shows which hand to use, for example BATHROOM — LEFT HAND. The system automatically creates a folder with that word's name inside clips.",
+  tree: "clips/\n└─ BATHROOM/   ← created automatically",
+};
+const STEP_RECORD = {
+  icon: "🎥",
+  title: "Record your sign",
+  text: `${useOPFS ? "Tap Record" : "Click Record (or press Space)"}. After the ${COUNTDOWN_S}-second countdown, sign with the hand shown in the badge. `
+      + (STOP_MODE === "hands-out"
+          ? "The recording stops by itself when you move your hands out of the frame. "
+          : "The recording stops by itself when you hold still. ")
+      + `${useOPFS ? "Tap Cancel" : "Press Esc"} to discard a clip (nothing is saved). Every clip is saved automatically as 2 files with the same name:`,
+  tree: `clips/\n└─ BATHROOM/\n   ├─ BATHROOM_LEFT_001.mp4   (the video)\n   └─ BATHROOM_LEFT_001.${LANDMARK_FORMAT}   (hand landmark data)`,
+};
+
 const INTRO_STEPS = useOPFS ? [
   {
     icon: "📱",
@@ -594,18 +650,8 @@ const INTRO_STEPS = useOPFS ? [
     text: "Tap the “📁 Create clips folder” button. The Record button stays locked until the folder is created. The folder is kept inside this website's storage on your phone.",
     tree: "clips/",
   },
-  {
-    icon: "🔤",
-    title: "Select a word from the dropdown",
-    text: "Open the dropdown and pick a word or letter. Each option shows which hand to use, for example BATHROOM — LEFT HAND. The system automatically creates a folder with that word's name inside clips.",
-    tree: "clips/\n└─ BATHROOM/   ← created automatically",
-  },
-  {
-    icon: "🎥",
-    title: "Record your sign",
-    text: `Tap Record. After the ${COUNTDOWN_S}-second countdown, sign with the hand shown in the badge. The recording stops by itself when you hold still. Tap Cancel to discard a clip (nothing is saved). Every clip is saved automatically as 2 files with the same name:`,
-    tree: `clips/\n└─ BATHROOM/\n   ├─ BATHROOM_LEFT_001.mp4   (the video)\n   └─ BATHROOM_LEFT_001.${LANDMARK_FORMAT}   (hand landmark data)`,
-  },
+  STEP_WORD,
+  STEP_RECORD,
   {
     icon: "☁️",
     title: "Save the ZIP and upload to Google Drive",
@@ -623,18 +669,8 @@ const INTRO_STEPS = useOPFS ? [
     title: "Choose the folder in the system",
     text: "On this page, click the “📁 Choose save folder” button, select your clips folder, and click Allow when the browser asks for permission. The Record button stays locked until a folder is chosen.",
   },
-  {
-    icon: "🔤",
-    title: "Select a word from the dropdown",
-    text: "Open the dropdown and pick a word or letter. Each option shows which hand to use, for example BATHROOM — LEFT HAND. The system automatically creates a folder with that word's name inside clips.",
-    tree: "clips/\n└─ BATHROOM/   ← created automatically",
-  },
-  {
-    icon: "🎥",
-    title: "Record your sign",
-    text: `Click Record (or press Space). After the ${COUNTDOWN_S}-second countdown, sign with the hand shown in the badge. The recording stops by itself when you hold still. Press Esc to cancel a clip (nothing is saved). Every clip is saved automatically as 2 files with the same name:`,
-    tree: `clips/\n└─ BATHROOM/\n   ├─ BATHROOM_LEFT_001.mp4   (the video)\n   └─ BATHROOM_LEFT_001.${LANDMARK_FORMAT}   (hand landmark data)`,
-  },
+  STEP_WORD,
+  STEP_RECORD,
   {
     icon: "☁️",
     title: "Upload your clips to Google Drive",
