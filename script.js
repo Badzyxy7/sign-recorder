@@ -8,6 +8,7 @@ const CATEGORIES = [
   { name: "WORDS",    labels: ["BATHROOM", "FATHER", "FOOD", "FRIEND", "HOME",
                                "MOTHER", "SCHOOL", "STUDENT", "TEACHER", "WATER"] },
   { name: "ALPHABET", labels: ["J", "Z"] },
+  { name: "IDLE (RANDOM SIGNS)", labels: ["IDLE"] },
 ];
 const SIDES  = ["LEFT", "RIGHT"];
 const USE_SUBFOLDERS = true;    // true: save into <chosen folder>/<WORD>/<WORD>_<SIDE>_001.mp4 (creates the subfolder if missing)
