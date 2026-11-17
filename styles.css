@@ -472,5 +472,8 @@ body.modal-open { overflow: hidden; }
 .stage + #recordBtn { margin-top: 12px; }
 #status { margin: 10px 0 14px; }
 
-/* Phone held upright: preview shows the same wide (16:9) frame that is recorded */
-.stage.crop169 { aspect-ratio: 16 / 9; }
+
+/* ---------- Performance ---------- */
+.stage { contain: layout paint; }
+.stage video, .stage canvas { will-change: transform; }
+.intro { backdrop-filter: none; }   /* blur is expensive on low-end devices */
